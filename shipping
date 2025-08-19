@@ -1,0 +1,198 @@
+// Package shipping implements a concurrent, fault-tolerant service for calculating
+// shipping rates from multiple carriers. It is designed for high-throughput
+// e-commerce platforms like Sticker Mule's Stores.
+package shipping
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+	"time"
+)
+
+// Rate represents a shipping option quote from a carrier.
+type Rate struct {
+	Carrier    string  `json:"carrier"`    // e.g., "USPS", "UPS"
+	Service    string  `json:"service"`    // e.g., "Priority Mail", "2nd Day Air"
+	Cost       float64 `json:"cost"`       // Cost in USD
+	EstDays    int     `json:"estDays"`    // Estimated transit days
+	TrackingID string  `json:"trackingId"` // Optional pre-generated tracking ID
+}
+
+// Request contains the information needed to get shipping quotes.
+type Request struct {
+	OriginZip      string  `json:"originZip"`
+	DestinationZip string  `json:"destinationZip"`
+	WeightLbs      float64 `json:"weightLbs"`
+	PackageType    string  `json:"packageType"` // "envelope", "package", "large_box"
+}
+
+// CarrierClient defines the interface that all carrier API clients must implement.
+// This abstraction allows for easy testing and the addition of new carriers.
+type CarrierClient interface {
+	GetRates(ctx context.Context, req Request) ([]Rate, error)
+	Name() string
+}
+
+// Service is the core orchestrator for fetching and aggregating shipping rates.
+// It is safe for concurrent use.
+type Service struct {
+	clients  []CarrierClient
+	timeout  time.Duration
+	cache    *Cache // In-memory or Redis-based cache for rates (pseudo-code)
+	logger   *slog.Logger
+}
+
+// NewService creates a new Shipping Service with the given clients and configuration.
+func NewService(clients []CarrierClient, timeout time.Duration, logger *slog.Logger) *Service {
+	return &Service{
+		clients: clients,
+		timeout: timeout,
+		logger:  logger,
+		// cache:   NewCache(), // Initialize a real cache here
+	}
+}
+
+// GetRates fetches shipping rates from all configured carriers concurrently.
+// It respects a global timeout and returns any successful results even if some carriers fail.
+func (s *Service) GetRates(ctx context.Context, req Request) ([]Rate, error) {
+	// 1. Check cache first (pseudo-code)
+	// if cachedRates, found := s.cache.Get(req); found {
+	//     s.logger.Info("serving rates from cache", "request", req)
+	//     return cachedRates, nil
+	// }
+
+	// 2. Set a deadline for the entire operation
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	// 3. Use a waitgroup and a mutex to coordinate goroutines
+	var wg sync.WaitGroup
+	ratesChan := make(chan []Rate, len(s.clients))
+	errChan := make(chan error, len(s.clients))
+
+	// 4. Fan out: Launch a goroutine for each carrier client
+	for _, client := range s.clients {
+		wg.Add(1)
+		go func(c CarrierClient) {
+			defer wg.Done()
+
+			// Fetch rates for this specific carrier
+			carrierRates, err := c.GetRates(ctx, req)
+			if err != nil {
+				// Log the error but don't fail the whole request.
+				// A single carrier failure should not break the user experience.
+				s.logger.Warn("carrier API request failed",
+					"carrier", c.Name(),
+					"error", err,
+				)
+				errChan <- err
+				return
+			}
+			ratesChan <- carrierRates
+		}(client)
+	}
+
+	// 5. Wait for all goroutines to finish, then close channels.
+	go func() {
+		wg.Wait()
+		close(ratesChan)
+		close(errChan)
+	}()
+
+	// 6. Collect results. This continues until channels are closed.
+	var allRates []Rate
+	for rates := range ratesChan {
+		allRates = append(allRates, rates...)
+	}
+
+	// 7. Check for any errors (optional, for logging/metrics)
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		s.logger.Info("some carriers failed", "error_count", len(errs))
+	}
+
+	// 8. If we got no rates and all clients failed, return a hard error.
+	if len(allRates) == 0 && len(errs) == len(s.clients) {
+		return nil, errors.New("all carrier APIs failed to respond")
+	}
+
+	// 9. Sort by cost or estimated days (a real implementation would do this)
+	// sort.Slice(allRates, func(i, j int) bool {
+	//     return allRates[i].Cost < allRates[j].Cost
+	// })
+
+	// 10. Cache the result before returning (pseudo-code)
+	// s.cache.Set(req, allRates, 5*time.Minute) // Cache for 5 minutes
+
+	return allRates, nil
+}
+
+// ---------------------- Example Client Implementation ----------------------
+
+// USPSClient is a concrete implementation for the USPS API.
+type USPSClient struct {
+	apiKey string
+	logger *slog.Logger
+}
+
+func (c *USPSClient) Name() string { return "USPS" }
+
+func (c *USPSClient) GetRates(ctx context.Context, req Request) ([]Rate, error) {
+	// ... Actual API integration logic using http.Client and context ...
+	// This would make an HTTP request, decode the JSON response, and map it to []Rate.
+
+	// Simulate a slow API call and return dummy data.
+	select {
+	case <-time.After(100 * time.Millisecond):
+		c.logger.Info("USPS rates calculated", "zip", req.DestinationZip)
+		return []Rate{
+			{Carrier: "USPS", Service: "Priority Mail", Cost: 8.75, EstDays: 2},
+			{Carrier: "USPS", Service: "First Class", Cost: 5.25, EstDays: 5},
+		}, nil
+	case <-ctx.Done():
+		c.logger.Warn("USPS request cancelled", "error", ctx.Err())
+		return nil, ctx.Err() // Respect the context deadline
+	}
+}
+
+// ---------------------- Example Usage in main.go ----------------------
+/*
+func main() {
+    logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+    // Configure clients
+    clients := []CarrierClient{
+        &USPSClient{apiKey: "your_usps_key", logger: logger},
+        // &UPSClient{...},
+        // &FedExClient{...},
+    }
+
+    // Create the service with a 3-second timeout
+    svc := NewService(clients, 3*time.Second, logger)
+
+    // Simulate an HTTP handler
+    req := Request{
+        OriginZip:      "12345",
+        DestinationZip: "98765",
+        WeightLbs:      1.5,
+        PackageType:    "package",
+    }
+
+    ctx := context.Background()
+    rates, err := svc.GetRates(ctx, req)
+
+    if err != nil {
+        logger.Error("failed to get rates", "error", err)
+        // Handle error (e.g., return 500 to user)
+        return
+    }
+
+    logger.Info("shipping rates calculated", "count", len(rates), "rates", rates)
+    // Return rates as JSON in an HTTP response
+}
+*/
